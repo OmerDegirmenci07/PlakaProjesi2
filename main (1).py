@@ -13,9 +13,11 @@ from collections import Counter
 # ======================================================
 # YAPILANDIRMA
 # ======================================================
-yolo_model_yolu = r"C:\Users\Omer\Desktop\PlakaProjesi\plaka_tanima.pt"
-video_yolu      = r"C:\Users\Omer\Desktop\PlakaProjesi\14674550_3840_2160_60fps.mp4"
-cikti_json      = r"C:\Users\Omer\Desktop\PlakaProjesi\results.json"
+proje_klasoru = os.path.dirname(os.path.abspath(__file__))
+
+yolo_model_yolu = os.path.join(proje_klasoru, "plaka_tanima.pt")
+video_yolu      = os.path.join(proje_klasoru, "14674550_3840_2160_60fps.mp4")
+cikti_json      = os.path.join(proje_klasoru, "results.json")
 
 kare_atlama      = 3      # Her 3 karede bir işle
 yolo_esik        = 0.45   # YOLO güven eşiği
