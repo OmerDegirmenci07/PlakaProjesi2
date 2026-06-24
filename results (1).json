@@ -1,0 +1,23 @@
+{
+  "video_id": "14674550_3840_2160_60fps.mp4",
+  "arac_bilgisi": {
+    "tip": "belirsiz",
+    "plaka": "34FBB547",
+    "renk": "belirsiz",
+    "confidence_score": 0.86
+  },
+  "tespitler": [
+    {
+      "zaman_saniye": 0.0,
+      "kategori": "arac_plakasi",
+      "etiket": "34FBB547",
+      "confidence_score": 0.86
+    },
+    {
+      "zaman_saniye": 0.0,
+      "kategori": "arac_plakasi",
+      "etiket": "03AHV206",
+      "confidence_score": 0.71
+    }
+  ]
+}
