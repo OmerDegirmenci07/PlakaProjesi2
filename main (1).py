@@ -1,251 +1,251 @@
-# ======================================================
-# PLAKA TANIMA MODÜLÜ - 5G & Yapay Zeka ile Akıllı Yol Güvenliği Yarışması
-# ======================================================
+"""
+Modul  : plaka_dedektoru.py
+Kaynak : Arac-tanima  (plaka_tanima__1_.pt + orijinal betik)
+Degisiklikler:
+  - Sabit Windows dosya yollari kaldirildi; parametrik hale getirildi.
+  - cv2.imshow / cv2.waitKey kaldirildi (headless Docker ortami).
+  - JSON yazma kaldirildi; sonuc dict olarak return ediliyor.
+  - segment bazli tespitler: video boyunca tum gecen plakalar toplanir,
+    en yuksek skorlu plaka "ana plaka" olarak secilir.
+  - tespitler listesi icin zaman damgasi (zaman_saniye) eklendi.
+  - Tum etiket ve anahtarlar FTR dokumani kurallarina uygundur.
+"""
 
 import cv2
-import easyocr
-import json
-import os
 import re
-import sys
+import os
 from collections import Counter
 
-# ======================================================
-# YAPILANDIRMA
-# ======================================================
-proje_klasoru = os.path.dirname(os.path.abspath(__file__))
+# EasyOCR ve YOLO sadece gerektiginde import edilecek
+# (import hatasi kontrolu main.py katmaninda)
+import easyocr
+from ultralytics import YOLO
 
-yolo_model_yolu = os.path.join(proje_klasoru, "plaka_tanima.pt")
-video_yolu      = os.path.join(proje_klasoru, "14674550_3840_2160_60fps.mp4")
-cikti_json      = os.path.join(proje_klasoru, "results.json")
+# -----------------------------------------------------------------------
+# Yapilandirma sabitleri
+# -----------------------------------------------------------------------
+KARE_ATLAMA     = 3      # Her N karede bir isle
+YOLO_ESIK       = 0.45   # YOLO guven esigi
+OCR_ESIK        = 0.35   # EasyOCR guven esigi
+BOS_KARE_ESIGI  = 20     # Kac bos kare = arac gitti
 
-kare_atlama      = 3      # Her 3 karede bir işle
-yolo_esik        = 0.45   # YOLO güven eşiği
-ocr_esik         = 0.35   # OCR güven eşiği
-bos_kare_esigi   = 20     # Kaç boş kare = araç gitti
-plaka_regex      = r"^(0[1-9]|[1-7][0-9]|8[01])[A-Z]{1,3}\d{2,5}$"
+# Turkiye plaka regex (bosluksuz, buyuk harf)
+PLAKA_REGEX = re.compile(
+    r"^(0[1-9]|[1-7][0-9]|8[01])[A-Z]{1,3}\d{2,5}$"
+)
 
-# ======================================================
-# 1. MODELLERİ BAŞLAT
-# ======================================================
-print("Modeller yükleniyor, lütfen bekleyin...")
+# -----------------------------------------------------------------------
+# Yardsimci fonksiyonlar
+# -----------------------------------------------------------------------
 
-try:
-    from ultralytics import YOLO
-    yolo_model = YOLO(yolo_model_yolu)
-except Exception as e:
-    print(f"HATA: YOLO modeli yüklenemedi: {e}")
-    sys.exit(1)
-
-reader = easyocr.Reader(['en'], gpu=True)
-print("Modeller hazır.\n")
-
-# ======================================================
-# 2. GÖRÜNTÜ ÖN İŞLEME
-# ======================================================
-
-def plaka_isle(kirpilmis_plaka):
-    """Büyüt → Keskinleştir → Gri → Otsu → OCR"""
-    if kirpilmis_plaka.size == 0:
+def _plaka_isle(kirpilmis: "np.ndarray", reader: "easyocr.Reader") -> list:
+    """Kirpilmis plaka bolgesine on isleme + OCR uygular."""
+    if kirpilmis.size == 0:
         return []
 
-    buyutulmus = cv2.resize(kirpilmis_plaka, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    gaussian = cv2.GaussianBlur(buyutulmus, (0, 0), 3)
-    keskin = cv2.addWeighted(buyutulmus, 1.5, gaussian, -0.5, 0)
-    gri = cv2.cvtColor(keskin, cv2.COLOR_BGR2GRAY)
-    yumusak = cv2.bilateralFilter(gri, 9, 15, 15)
-    _, islenmis = cv2.threshold(yumusak, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
+    import cv2 as _cv2
+    buyutulmus = _cv2.resize(kirpilmis, None, fx=2, fy=2,
+                             interpolation=_cv2.INTER_CUBIC)
+    gaussian   = _cv2.GaussianBlur(buyutulmus, (0, 0), 3)
+    keskin     = _cv2.addWeighted(buyutulmus, 1.5, gaussian, -0.5, 0)
+    gri        = _cv2.cvtColor(keskin, _cv2.COLOR_BGR2GRAY)
+    yumusak    = _cv2.bilateralFilter(gri, 9, 15, 15)
+    _, islenmis = _cv2.threshold(yumusak, 0, 255,
+                                  _cv2.THRESH_BINARY + _cv2.THRESH_OTSU)
     return reader.readtext(
         islenmis,
-        allowlist='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+        allowlist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
         detail=1,
-        paragraph=False
+        paragraph=False,
     )
 
-def metni_temizle(metin):
-    """OCR çıktısını normalize eder - PDF'deki kurallara uygun"""
-    temiz = re.sub(r'\s+', '', metin).upper()
-    temiz = temiz.replace('Ç','C').replace('Ğ','G').replace('İ','I') \
-                 .replace('Ö','O').replace('Ş','S').replace('Ü','U')
-    temiz = temiz.replace('Q','A').replace('X','K').replace('W','M')
-    return temiz
 
-def segmenti_isle(segment_havuzu, segment_no):
-    """Segmentteki plaka havuzundan en güvenilir plakayı seçer"""
-    if not segment_havuzu:
+def _temizle(metin: str) -> str:
+    """OCR ciktisini Turkce karakter ve bosluk icermeyen buyuk harfe donusturur."""
+    t = re.sub(r"\s+", "", metin).upper()
+    for src, dst in [("Ç","C"),("Ğ","G"),("İ","I"),("Ö","O"),("Ş","S"),("Ü","U"),
+                     ("Q","A"),("X","K"),("W","M")]:
+        t = t.replace(src, dst)
+    return t
+
+
+def _segmentten_en_iyi(havuz: list) -> dict | None:
+    """Plaka havuzundan en guvenilir plaka-skor ciftini secer."""
+    if not havuz:
         return None
 
-    frekanslar = Counter([p["plaka"] for p in segment_havuzu])
-    sirali = frekanslar.most_common()
-    max_frekans = sirali[0][1]
-    dinamik_baraj = max(2, max_frekans * 0.25)
+    frekanslar  = Counter(p["plaka"] for p in havuz)
+    max_frekans = frekanslar.most_common(1)[0][1]
+    dinamik_baj = max(2, max_frekans * 0.25)
 
     gecerli = []
-    for plaka, frekans in sirali:
-        if frekans >= dinamik_baraj:
-            skorlar = [p["skor"] for p in segment_havuzu if p["plaka"] == plaka]
-            gecerli.append({
-                "plaka": plaka,
-                "frekans": frekans,
-                "skor": round(max(skorlar), 2)
-            })
+    for plaka, frekans in frekanslar.most_common():
+        if frekans >= dinamik_baj:
+            maks_skor = max(p["skor"] for p in havuz if p["plaka"] == plaka)
+            gecerli.append({"plaka": plaka, "frekans": frekans,
+                             "skor": round(maks_skor, 2)})
 
-    if gecerli:
-        en_iyi = gecerli[0]
-        print(f"\n{'='*45}")
-        print(f"  ARAÇ #{segment_no} TESPİT EDİLDİ")
-        print(f"  Plaka : {en_iyi['plaka']}")
-        print(f"  Skor  : {en_iyi['skor']:.2f}  |  Okunma: {en_iyi['frekans']}")
-        print(f"{'='*45}")
-        return en_iyi
+    return gecerli[0] if gecerli else None
 
-    return None
 
-# ======================================================
-# 3. VİDEO İŞLEME DÖNGÜSÜ
-# ======================================================
-print(f"Video açılıyor: {video_yolu}")
+# -----------------------------------------------------------------------
+# Ana sinif
+# -----------------------------------------------------------------------
 
-if not os.path.exists(video_yolu):
-    print(f"HATA: Video bulunamadı → {video_yolu}")
-    sys.exit(1)
+class PlakaDedektoru:
+    """
+    YOLOv8 + EasyOCR tabanli plaka tanima modulu.
 
-cap = cv2.VideoCapture(video_yolu)
-if not cap.isOpened():
-    print("HATA: Video açılamadı.")
-    sys.exit(1)
+    Parametreler
+    ------------
+    model_yolu : str
+        YOLO plaka tespit modelinin agirlık dosyasi (.pt).
+    gpu        : bool
+        EasyOCR icin GPU kullanim tercihi.
+    """
 
-fps = cap.get(cv2.CAP_PROP_FPS) or 30
-toplam_kare = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-print(f"Video bilgisi: {toplam_kare} kare | {fps:.0f} FPS\n")
+    def __init__(self, model_yolu: str, gpu: bool = True):
+        print("[PlakaDedektoru] YOLO modeli yukleniyor...")
+        self.model  = YOLO(model_yolu)
+        print("[PlakaDedektoru] EasyOCR baslatiliyor (ilk seferinde indirme olabilir)...")
+        try:
+            self.reader = easyocr.Reader(["en"], gpu=gpu)
+            print("[PlakaDedektoru] GPU ile EasyOCR aktif.")
+        except Exception:
+            self.reader = easyocr.Reader(["en"], gpu=False)
+            print("[PlakaDedektoru] CPU ile EasyOCR aktif.")
 
-tum_araclar = []
-segment_havuzu = []
-bos_kare_sayisi = 0
-segment_aktif = False
-segment_no = 0
-kare_sayaci = 0
+    # ------------------------------------------------------------------
+    def video_tara(self, video_path: str) -> dict:
+        """
+        Tum videoyu tarar; plaka tespitlerini dondurur.
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
+        Donus
+        -----
+        {
+            "ana_plaka"  : str,           # En yuksek skorlu plaka ("tespit_edilemedi")
+            "ana_skor"   : float,         # 0.0 – 1.0
+            "tespitler"  : [              # Her segmentteki plaka kayitlari
+                {
+                    "zaman_saniye"    : float,
+                    "plaka"           : str,
+                    "confidence_score": float
+                }, ...
+            ]
+        }
+        """
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Video acilamadi: {video_path}")
 
-    kare_sayaci += 1
+        fps            = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        tum_araclar    = []   # Segment bazli en iyi plakalar
+        segment_havuzu = []
+        bos_kare_no    = 0
+        segment_aktif  = False
+        segment_no     = 0
+        kare_sayaci    = 0
 
-    if kare_sayaci % kare_atlama != 0:
-        continue
+        # Segment baslangic zamanini takip et
+        segment_bas_zaman = 0.0
 
-    try:
-        sonuclar = yolo_model(frame, conf=yolo_esik, verbose=False)
-    except Exception as e:
-        print(f"YOLO hatası kare {kare_sayaci}: {e}")
-        continue
+        print("[PlakaDedektoru] Video isleniyor...")
 
-    bu_karede_plaka_var = False
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-    for sonuc in sonuclar:
-        for box in sonuc.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            yolo_guven = float(box.conf[0])
+            kare_sayaci += 1
 
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = max(0, x2), max(0, y2)
-            
-            if x2 <= x1 or y2 <= y1:
+            if kare_sayaci % KARE_ATLAMA != 0:
                 continue
 
-            kirpilmis_plaka = frame[y1:y2, x1:x2]
-            ocr_sonuclar = plaka_isle(kirpilmis_plaka)
+            zaman_saniye = round(kare_sayaci / fps, 2)
 
-            for _, metin, ocr_skoru in ocr_sonuclar:
-                if ocr_skoru < ocr_esik:
-                    continue
+            try:
+                sonuclar = self.model(frame, conf=YOLO_ESIK, verbose=False)
+            except Exception as e:
+                print(f"  [UYARI] YOLO hatasi kare {kare_sayaci}: {e}")
+                continue
 
-                temiz_metin = metni_temizle(metin)
+            bu_karede_plaka = False
 
-                if re.match(plaka_regex, temiz_metin):
-                    birlesik_skor = (ocr_skoru + yolo_guven) / 2
-                    segment_havuzu.append({"plaka": temiz_metin, "skor": birlesik_skor})
-                    bu_karede_plaka_var = True
-                    segment_aktif = True
-                    print(f"  → Kare {kare_sayaci}: {temiz_metin} ({birlesik_skor:.2f})")
+            for sonuc in sonuclar:
+                for box in sonuc.boxes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = max(0, x2), max(0, y2)
 
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    if x2 <= x1 or y2 <= y1:
+                        continue
 
-    if not bu_karede_plaka_var and segment_aktif:
-        bos_kare_sayisi += 1
+                    yolo_guven   = float(box.conf[0])
+                    kirpilmis    = frame[y1:y2, x1:x2]
+                    ocr_sonuclar = _plaka_isle(kirpilmis, self.reader)
 
-        if bos_kare_sayisi >= bos_kare_esigi:
+                    for _, metin, ocr_skoru in ocr_sonuclar:
+                        if ocr_skoru < OCR_ESIK:
+                            continue
+                        temiz = _temizle(metin)
+                        if PLAKA_REGEX.match(temiz):
+                            birlesik = round((ocr_skoru + yolo_guven) / 2, 2)
+                            segment_havuzu.append({
+                                "plaka"       : temiz,
+                                "skor"        : birlesik,
+                                "zaman_saniye": zaman_saniye,
+                            })
+                            bu_karede_plaka  = True
+                            segment_aktif    = True
+                            if not segment_havuzu or len(segment_havuzu) == 1:
+                                segment_bas_zaman = zaman_saniye
+
+            # Segment bitis kontrolu
+            if not bu_karede_plaka and segment_aktif:
+                bos_kare_no += 1
+                if bos_kare_no >= BOS_KARE_ESIGI:
+                    segment_no += 1
+                    en_iyi = _segmentten_en_iyi(segment_havuzu)
+                    if en_iyi:
+                        en_iyi["zaman_saniye"] = segment_bas_zaman
+                        tum_araclar.append(en_iyi)
+                        print(f"  [Segment {segment_no}] Plaka: {en_iyi['plaka']}  "
+                              f"Skor: {en_iyi['skor']}  t={segment_bas_zaman}s")
+                    segment_havuzu  = []
+                    bos_kare_no     = 0
+                    segment_aktif   = False
+            else:
+                bos_kare_no = 0
+
+        # Videoda kalan son segment
+        if segment_havuzu:
             segment_no += 1
-            sonuc = segmenti_isle(segment_havuzu, segment_no)
-            if sonuc:
-                tum_araclar.append(sonuc)
+            en_iyi = _segmentten_en_iyi(segment_havuzu)
+            if en_iyi:
+                en_iyi["zaman_saniye"] = segment_bas_zaman
+                tum_araclar.append(en_iyi)
 
-            segment_havuzu = []
-            bos_kare_sayisi = 0
-            segment_aktif = False
-    else:
-        bos_kare_sayisi = 0
+        cap.release()
+        print(f"[PlakaDedektoru] {segment_no} araç segmenti islendi.")
 
-    gosterim = cv2.resize(frame, (1280, 720))
-    cv2.imshow('Plaka Tanima', gosterim)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        # En yuksek skorlu plaka = ana plaka
+        if tum_araclar:
+            en_iyi_arac  = max(tum_araclar, key=lambda x: x["skor"])
+            ana_plaka    = en_iyi_arac["plaka"]
+            ana_skor     = en_iyi_arac["skor"]
+        else:
+            ana_plaka = "tespit_edilemedi"
+            ana_skor  = 0.0
 
-if segment_havuzu:
-    segment_no += 1
-    sonuc = segmenti_isle(segment_havuzu, segment_no)
-    if sonuc:
-        tum_araclar.append(sonuc)
-
-cap.release()
-cv2.destroyAllWindows()
-
-# ======================================================
-# 4. JSON ÇIKTISI
-# ======================================================
-print(f"\n{'='*45}")
-print(f"  TOPLAM TESPİT EDİLEN ARAÇ: {len(tum_araclar)}")
-print(f"{'='*45}")
-
-if tum_araclar:
-    for i, arac in enumerate(tum_araclar, 1):
-        print(f"  {i}. Araç → {arac['plaka']} (Skor: {arac['skor']:.2f})")
-
-    en_iyi_arac = max(tum_araclar, key=lambda x: x["skor"])
-    nihai_plaka = en_iyi_arac["plaka"]
-    nihai_skor = en_iyi_arac["skor"]
-else:
-    print("  Hiçbir araç tespit edilemedi.")
-    nihai_plaka = ""
-    nihai_skor = 0.0
-
-# Format: "arac_bilgisi" ve "tespitler" anahtarları
-cikis_verisi = {
-    "video_id": os.path.basename(video_yolu),
-    "arac_bilgisi": {
-        "tip": "belirsiz",       # Diğer modüller dolduruyor
-        "plaka": nihai_plaka,
-        "renk": "belirsiz",      # Diğer modüller dolduruyor
-        "confidence_score": round(float(nihai_skor), 4)
-    },
-    "tespitler": [
-        {
-            "zaman_saniye": 0.0,
-            "kategori": "arac_plakasi",
-            "etiket": arac["plaka"],
-            "confidence_score": round(float(arac["skor"]), 4)
+        return {
+            "ana_plaka": ana_plaka,
+            "ana_skor" : round(ana_skor, 2),
+            "tespitler": [
+                {
+                    "zaman_saniye"    : a["zaman_saniye"],
+                    "plaka"           : a["plaka"],
+                    "confidence_score": a["skor"],
+                }
+                for a in tum_araclar
+            ],
         }
-        for arac in tum_araclar
-    ]
-}
-
-with open(cikti_json, "w", encoding="utf-8") as f:
-    json.dump(cikis_verisi, f, ensure_ascii=False, indent=2)
-
-print(f"\n  JSON kaydedildi: {cikti_json}")
-print(f"  Ana Araç Plakası: {nihai_plaka}")
-print(f"  Güven Skoru: {nihai_skor:.4f}")
-print(f"{'='*45}\n")
